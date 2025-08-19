@@ -1,0 +1,483 @@
+// ==UserScript==
+// @name         Cookie Controller
+// @namespace    http://tampermonkey.net/
+// @version      6.2
+// @description  Auto-buy queue, auto golden cookie/reindeer, smart autogame with cookie clicking, drag/drop reorder queue, status display, GUI toggle with backtick (`).
+// @author       ChatGPT
+// @match        https://orteil.dashnet.org/cookieclicker/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // === State Variables ===
+    let guiVisible = false;
+    let purchaseQueue = [];
+    let isProcessing = false;
+    let autoGoldenCookie = false;
+    let autoGame = false;
+
+    let autoGameInterval = null;
+    let autoGameClickInterval = null;
+    let queueInterval = null;
+
+    // === Create GUI ===
+    const gui = document.createElement('div');
+    gui.id = 'cookie-controller-gui';
+    gui.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background-color: rgba(0,0,0,0.85);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        z-index: 999999;
+        display: none;
+        width: 700px;
+        max-height: 85vh;
+        overflow-y: auto;
+        font-family: Arial, sans-serif;
+        user-select: none;
+        box-shadow: 0 0 15px 3px #ffae00;
+    `;
+
+    gui.innerHTML = `
+        <h2 style="text-align:center; margin-bottom: 10px;">🍪 Cookie Controller</h2>
+        <p style="text-align:center; font-size: 14px; margin-bottom: 10px;">
+          Press \` (backtick) to toggle this window<br>
+          Click buttons below to add buildings or upgrades to queue
+        </p>
+
+        <div id="buttons-container" style="
+            display: flex; flex-wrap: wrap; gap: 5px; justify-content: center; max-height: 180px; overflow-y: auto;
+            background: #111; padding: 10px; border-radius: 8px;
+        ">
+        Loading buttons...
+        </div>
+
+        <h3 style="margin-top: 20px;">Purchase Queue (drag to reorder):</h3>
+        <ul id="queue-display" style="
+            max-height: 180px;
+            overflow-y: auto;
+            list-style: none;
+            padding: 0;
+            margin: 0 0 10px 0;
+            border: 1px solid #444;
+            border-radius: 5px;
+            background: #222;
+        "></ul>
+
+        <div id="auto-buy-status" style="
+            margin-bottom: 10px;
+            font-style: italic;
+            text-align: center;
+            color: #ddd;
+            min-height: 24px;
+            user-select: text;
+        ">Idle</div>
+
+        <div style="text-align:center; display: flex; justify-content: center; gap: 15px; flex-wrap: wrap;">
+            <button id="start-auto-buy" style="padding:8px 15px; font-size:14px; cursor:pointer;">▶️ Start Auto-Buy</button>
+            <button id="clear-queue" style="padding:8px 15px; font-size:14px; cursor:pointer;">🗑️ Clear Queue</button>
+            <button id="toggle-golden-cookie" style="padding:8px 15px; font-size:14px; cursor:pointer;">✨ Auto Golden Cookie: OFF</button>
+            <button id="toggle-auto-game" style="padding:8px 15px; font-size:14px; cursor:pointer;">🤖 AutoGame: OFF</button>
+        </div>
+
+        <p style="margin-top:10px; font-size: 12px; text-align:center; color:#aaa;">
+            * AutoGame overrides manual queue and buys best items automatically.<br>
+            * AutoGame also clicks the cookie 5 times/second.<br>
+            * Queue purchases buildings/upgrades in order when enough cookies are available.<br>
+            * Drag items in the queue to reorder or remove with the ❌ button.
+        </p>
+    `;
+
+    document.body.appendChild(gui);
+
+    const buttonsContainer = gui.querySelector('#buttons-container');
+    const queueDisplay = gui.querySelector('#queue-display');
+    const statusDisplay = gui.querySelector('#auto-buy-status');
+    const startAutoBuyBtn = gui.querySelector('#start-auto-buy');
+    const clearQueueBtn = gui.querySelector('#clear-queue');
+    const toggleGoldenBtn = gui.querySelector('#toggle-golden-cookie');
+    const toggleAutoGameBtn = gui.querySelector('#toggle-auto-game');
+
+    // === Utility: Beautify numbers like Game's Beautify ===
+    function Beautify(num) {
+        if (typeof Game !== 'undefined' && Game.Beautify) return Game.Beautify(num);
+        return num.toLocaleString();
+    }
+
+    function populateButtons() {
+        buttonsContainer.innerHTML = '';
+        for (const b of Game.ObjectsById) {
+            const btn = document.createElement('button');
+            btn.textContent = `🏗️ ${b.name}`;
+            btn.title = `Add 1 ${b.name} to queue`;
+            btn.style.cssText = `
+                padding: 6px 10px;
+                background: #444;
+                border-radius: 5px;
+                border: none;
+                color: white;
+                cursor: pointer;
+                user-select: none;
+                flex: 0 1 120px;
+            `;
+            btn.onclick = () => addToQueue(b.name, b.id, 'building');
+            buttonsContainer.appendChild(btn);
+        }
+
+        buttonsContainer.appendChild(document.createElement('hr'));
+
+        for (const u of Game.UpgradesInStore) {
+            const btn = document.createElement('button');
+            btn.textContent = `✨ ${u.name}`;
+            btn.title = `Add 1 ${u.name} upgrade to queue`;
+            btn.style.cssText = `
+                padding: 6px 10px;
+                background: #335;
+                border-radius: 5px;
+                border: none;
+                color: white;
+                cursor: pointer;
+                user-select: none;
+                flex: 0 1 140px;
+            `;
+            btn.onclick = () => addToQueue(u.name, u.id, 'upgrade');
+            buttonsContainer.appendChild(btn);
+        }
+    }
+
+    function addToQueue(name, id, type) {
+        const existing = purchaseQueue.find(item => item.id === id && item.type === type);
+        if (existing) {
+            existing.count++;
+        } else {
+            purchaseQueue.push({ name, id, type, count: 1, purchased: 0 });
+        }
+        updateQueueDisplay();
+    }
+
+    function updateQueueDisplay() {
+        queueDisplay.innerHTML = '';
+        purchaseQueue.forEach((item, idx) => {
+            const li = document.createElement('li');
+            li.textContent = `${item.name} × ${item.count}`;
+            li.style.cssText = `
+                background: #333;
+                margin: 5px 10px;
+                padding: 8px 12px;
+                border-radius: 6px;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                cursor: grab;
+                user-select: none;
+            `;
+            li.draggable = true;
+            li.dataset.index = idx;
+
+            const removeBtn = document.createElement('button');
+            removeBtn.textContent = '❌';
+            removeBtn.style.cssText = `
+                background: #900;
+                border: none;
+                border-radius: 3px;
+                color: white;
+                cursor: pointer;
+                margin-left: 12px;
+                font-weight: bold;
+            `;
+            removeBtn.onclick = (e) => {
+                e.stopPropagation();
+                purchaseQueue.splice(idx, 1);
+                updateQueueDisplay();
+            };
+
+            li.appendChild(removeBtn);
+
+            li.addEventListener('dragstart', dragStart);
+            li.addEventListener('dragover', dragOver);
+            li.addEventListener('drop', drop);
+            li.addEventListener('dragend', dragEnd);
+
+            queueDisplay.appendChild(li);
+        });
+    }
+
+    let dragSrcEl = null;
+    function dragStart(e) {
+        dragSrcEl = this;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', this.dataset.index);
+        this.style.opacity = '0.4';
+    }
+    function dragOver(e) {
+        e.preventDefault();
+        return false;
+    }
+    function drop(e) {
+        e.stopPropagation();
+        const srcIndex = parseInt(e.dataTransfer.getData('text/plain'), 10);
+        const tgtIndex = parseInt(this.dataset.index, 10);
+        if (srcIndex === tgtIndex) return false;
+        const moved = purchaseQueue.splice(srcIndex, 1)[0];
+        purchaseQueue.splice(tgtIndex, 0, moved);
+        updateQueueDisplay();
+        return false;
+    }
+    function dragEnd() {
+        this.style.opacity = '1';
+    }
+
+    function processQueue() {
+        if (isProcessing || autoGame) return;
+        if (purchaseQueue.length === 0) {
+            isProcessing = false;
+            statusDisplay.textContent = 'Queue is empty';
+            clearInterval(queueInterval);
+            queueInterval = null;
+            return;
+        }
+        isProcessing = true;
+        if (queueInterval) return;
+
+        queueInterval = setInterval(() => {
+            if (autoGame || purchaseQueue.length === 0) {
+                clearInterval(queueInterval);
+                queueInterval = null;
+                isProcessing = false;
+                statusDisplay.textContent = 'Idle';
+                return;
+            }
+
+            const current = purchaseQueue[0];
+            let item = current.type === 'building' ? Game.ObjectsById[current.id] : Game.UpgradesById[current.id];
+            if (!item) {
+                purchaseQueue.shift();
+                updateQueueDisplay();
+                return;
+            }
+
+            const price = item.getPrice ? item.getPrice() : item.basePrice;
+            statusDisplay.textContent = `Buying ${current.name} (${current.purchased}/${current.count}) - cost: ${Math.floor(price)} cookies`;
+
+            if (Game.cookies >= price) {
+                current.type === 'building' ? item.buy(1) : item.buy();
+                current.purchased++;
+                statusDisplay.textContent = `Bought ${current.name} (${current.purchased}/${current.count})`;
+            }
+
+            if (current.purchased >= current.count) {
+                purchaseQueue.shift();
+                updateQueueDisplay();
+                statusDisplay.textContent = `Completed buying ${current.name}`;
+            }
+        }, 600);
+    }
+
+    // === Efficiency / Payback calculations ===
+
+    // Return payback time in seconds for upgrade, or 0 if not worthwhile
+    function getUpgradePayback(upg) {
+        if (!upg.canBuy() || upg.bought || Game.cookies < upg.getPrice()) return 0;
+
+        // Estimate increase in CPS from upgrade:
+        // Rough approach: 
+        // Check current CPS, then simulate buy and get CPS increase difference
+        let currentCps = Game.cookiesPs;
+        let price = upg.getPrice();
+
+        // Temporarily simulate buying upgrade:
+        let tempBought = upg.bought;
+        upg.bought = 1; // simulate bought
+        Game.CalculateGains();
+
+        let newCps = Game.cookiesPs;
+        let gain = newCps - currentCps;
+
+        // revert simulation
+        upg.bought = tempBought;
+        Game.CalculateGains();
+
+        if (gain <= 0) return 0;
+
+        return price / gain; // seconds payback
+    }
+
+    // Return payback time in seconds for building, or 0 if not worthwhile
+    function getBuildingPayback(bld) {
+        if (!bld.getPrice || Game.cookies < bld.getPrice()) return 0;
+
+        let price = bld.getPrice();
+        let cpsGain = bld.storedCps || bld.cps || 0;
+        if (cpsGain <= 0) return 0;
+
+        return price / cpsGain; // seconds payback
+    }
+
+    // Pick best affordable upgrade or building based on shortest payback
+    function getBestPaybackChoice() {
+        // Upgrades
+        let bestUpgrade = null;
+        let bestUpgradePayback = Infinity;
+
+        for (const upg of Game.UpgradesInStore) {
+            let pb = getUpgradePayback(upg);
+            if (pb > 0 && pb < bestUpgradePayback) {
+                bestUpgradePayback = pb;
+                bestUpgrade = upg;
+            }
+        }
+
+        // Buildings
+        let bestBuilding = null;
+        let bestBuildingPayback = Infinity;
+
+        for (const bld of Game.ObjectsById) {
+            let pb = getBuildingPayback(bld);
+            if (pb > 0 && pb < bestBuildingPayback) {
+                bestBuildingPayback = pb;
+                bestBuilding = bld;
+            }
+        }
+
+        // Decide which to buy: the one with lower payback time (better investment)
+        if (bestUpgrade && bestBuilding) {
+            if (bestUpgradePayback <= bestBuildingPayback) {
+                return { type: 'upgrade', item: bestUpgrade, payback: bestUpgradePayback };
+            } else {
+                return { type: 'building', item: bestBuilding, payback: bestBuildingPayback };
+            }
+        } else if (bestUpgrade) {
+            return { type: 'upgrade', item: bestUpgrade, payback: bestUpgradePayback };
+        } else if (bestBuilding) {
+            return { type: 'building', item: bestBuilding, payback: bestBuildingPayback };
+        }
+
+        return null; // nothing affordable or worthwhile
+    }
+
+    // === AutoGame main loop ===
+    function runAutoGame() {
+        if (!autoGame) {
+            statusDisplay.textContent = 'Idle';
+            clearInterval(autoGameInterval);
+            clearInterval(autoGameClickInterval);
+            autoGameInterval = null;
+            autoGameClickInterval = null;
+            return;
+        }
+
+        if (!autoGameClickInterval) {
+            autoGameClickInterval = setInterval(() => Game.ClickCookie(), 200); // Click 5 times/sec
+        }
+
+        if (!autoGameInterval) {
+            autoGameInterval = setInterval(() => {
+                const best = getBestPaybackChoice();
+                if (best) {
+                    const name = best.item.name;
+                    const price = best.item.getPrice?.() ?? 0;
+                    const payback = best.payback.toFixed(1);
+
+                    statusDisplay.textContent = `AutoGame: Preparing to buy ${name} (Cost: ${Beautify(price)} | Payback: ${payback}s)`;
+
+                    setTimeout(() => {
+                        if (Game.cookies >= price) {
+                            if (best.type === 'upgrade') best.item.buy();
+                            else best.item.buy(1);
+
+                            statusDisplay.textContent = `AutoGame: Bought ${name}`;
+                        } else {
+                            statusDisplay.textContent = `AutoGame: Could not afford ${name} (${Beautify(price)})`;
+                        }
+                    }, 400); // Short delay before purchase
+                } else {
+                    statusDisplay.textContent = 'AutoGame: Waiting for affordable option...';
+                }
+            }, 1500);
+        }
+    }
+
+    // === Auto golden cookie/reindeer ===
+    setInterval(() => {
+        if (!autoGoldenCookie) return;
+        if (!Game.shimmers || Game.shimmers.length === 0) return;
+        for (const shimmer of Game.shimmers) {
+            if (shimmer.type === 'golden' || shimmer.type === 'reindeer') {
+                shimmer.pop();
+            }
+        }
+    }, 100);
+
+    // === Button event handlers ===
+    startAutoBuyBtn.onclick = () => {
+        if (autoGame) {
+            alert("Disable AutoGame first!");
+            return;
+        }
+        if (purchaseQueue.length === 0) {
+            alert("Queue is empty!");
+            return;
+        }
+        if (queueInterval) return;
+        processQueue();
+    };
+
+    clearQueueBtn.onclick = () => {
+        purchaseQueue = [];
+        updateQueueDisplay();
+        statusDisplay.textContent = 'Queue cleared';
+    };
+
+    toggleGoldenBtn.onclick = () => {
+        autoGoldenCookie = !autoGoldenCookie;
+        toggleGoldenBtn.textContent = `✨ Auto Golden Cookie: ${autoGoldenCookie ? 'ON' : 'OFF'}`;
+    };
+
+    toggleAutoGameBtn.onclick = () => {
+        autoGame = !autoGame;
+        toggleAutoGameBtn.textContent = `🤖 AutoGame: ${autoGame ? 'ON' : 'OFF'}`;
+        if (autoGame) {
+            // Stop normal queue if running
+            if (queueInterval) {
+                clearInterval(queueInterval);
+                queueInterval = null;
+            }
+            runAutoGame();
+        } else {
+            if (autoGameInterval) {
+                clearInterval(autoGameInterval);
+                autoGameInterval = null;
+            }
+            if (autoGameClickInterval) {
+                clearInterval(autoGameClickInterval);
+                autoGameClickInterval = null;
+            }
+            statusDisplay.textContent = 'Idle';
+        }
+    };
+
+    // === GUI toggle with backtick (`) ===
+    document.addEventListener('keydown', (e) => {
+        if (e.key === '`') {
+            guiVisible = !guiVisible;
+            gui.style.display = guiVisible ? 'block' : 'none';
+        }
+    });
+
+    // Initial population of buttons
+    function waitForGameReady() {
+        if (typeof Game === 'undefined' || !Game.ready) {
+            setTimeout(waitForGameReady, 1000);
+        } else {
+            populateButtons();
+        }
+    }
+    waitForGameReady();
+
+})();
